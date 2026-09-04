@@ -35,6 +35,9 @@ static void clear_bootcom_magic()
  * Register layout differs between MCU families:
  *   L4: RCC->CSR.IWDGRSTF (bit 29), cleared by writing RMVF
  *   H7: RCC->RSR.IWDG1RSTF (different bit), cleared by writing RMVF
+ *   C5: RCC->RSR.IWDGRSTF (bit 29, single IWDG so no "1" suffix), cleared by
+ *       writing RMVF -- UNVERIFIED, taken from the STM32C5 CMSIS device
+ *       header (stm32c532xx.h); confirm against the reference manual.
  */
 static bool g_app_crashed_via_iwdg;
 
@@ -42,6 +45,9 @@ static void capture_reset_cause()
 {
 #if defined(STM32H7xx) || defined(STM32H7)
     g_app_crashed_via_iwdg = (RCC->RSR & RCC_RSR_IWDG1RSTF) != 0;
+    RCC->RSR |= RCC_RSR_RMVF;
+#elif defined(STM32C5xx) || defined(STM32C5)
+    g_app_crashed_via_iwdg = (RCC->RSR & RCC_RSR_IWDGRSTF) != 0;
     RCC->RSR |= RCC_RSR_RMVF;
 #else
     g_app_crashed_via_iwdg = (RCC->CSR & RCC_CSR_IWDGRSTF) != 0;
