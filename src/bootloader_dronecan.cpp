@@ -22,6 +22,11 @@
    retries every 750 ms, so this is several attempts. */
 #define BL_FIRST_REPLY_TIMEOUT_MS 5000
 
+/* How long a download that has started may go without progress before it's
+   abandoned. The old app is already partly erased by then, so the bootloader
+   reports ERROR and waits for a fresh BeginFirmwareUpdate. */
+#define BL_STALL_TIMEOUT_MS 10000
+
 static DroneCAN g_dronecan;
 static bool     g_last_chunk_seen = false;
 static uint32_t g_last_chunk_offset = 0;
@@ -34,6 +39,7 @@ static uint32_t g_last_progress_log_kb = 0;
 static bool     g_first_reply_pending = false;
 static uint8_t  g_download_server = 0;
 static uint32_t g_download_started_ms = 0;
+static uint32_t g_last_progress_ms = 0;
 static char     g_download_path[sizeof(((struct app_bootloader_comms *)0)->path)];
 
 /* Format a short message and broadcast via DroneCAN debug.LogMessage. The
@@ -68,6 +74,7 @@ static void mirror_bootcom(uint8_t server, const char *path, uint16_t plen)
     bc->my_node_id     = canardGetLocalNodeID(&g_dronecan.canard);
     memcpy((void *)bc->path, path, plen);
     bc->path[plen] = 0;
+    bootcom_commit();
 }
 
 /* Log why flash couldn't be armed. */
@@ -91,16 +98,18 @@ static void log_flash_begin_failure(void)
             (unsigned long)d.acr);
 }
 
-/* Give up on a download and show the bootloader as waiting again. */
-static void abandon_download(void)
+/* Give up on a download and show the bootloader as waiting again: health OK
+   if flash was never touched, ERROR if the old app is partly erased. */
+static void abandon_download(uint8_t health)
 {
     g_dronecan.firmware_download_finish();
     g_first_reply_pending = false;
     volatile struct app_bootloader_comms *bc = bootcom();
     bc->magic    = 0;
     bc->reserved = 0;
+    bootcom_commit();
     g_dronecan.set_node_status_override(
-        UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK,
+        health,
         UAVCAN_PROTOCOL_NODESTATUS_MODE_MAINTENANCE,
         0);
 }
@@ -115,6 +124,7 @@ static void start_download(uint8_t server_node_id, const char *path, uint16_t pl
     g_first_reply_pending  = true;
     g_download_server      = server_node_id;
     g_download_started_ms  = millis();
+    g_last_progress_ms     = g_download_started_ms;
     /* Drop the MAINTENANCE override so the lib's SOFTWARE_UPDATE mode and
        VSSC=KB progress flow through NodeStatus during the download. */
     g_dronecan.clear_node_status_override();
@@ -230,7 +240,7 @@ static void bl_on_transfer_received(CanardInstance *ins, CanardRxTransfer *trans
                 if (!read_ok) {
                     bl_logf(LOG_WARNING, "download: server error %d, waiting for BeginFirmwareUpdate",
                             (int)peek.error.value);
-                    abandon_download();
+                    abandon_download(UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK);
                     break;
                 }
                 g_first_reply_pending = false;
@@ -248,6 +258,9 @@ static void bl_on_transfer_received(CanardInstance *ins, CanardRxTransfer *trans
             g_dronecan.handle_file_read_response(transfer);
 
             uint32_t after = g_dronecan.firmware_download_offset();
+            if (after != before) {
+                g_last_progress_ms = millis();
+            }
 
             /* The server reported an error and the client gave up: the old
                app may already be partly erased, so say so rather than sit
@@ -255,11 +268,7 @@ static void bl_on_transfer_received(CanardInstance *ins, CanardRxTransfer *trans
             if (decode_ok && !read_ok && was_active && !g_dronecan.firmware_download_active()) {
                 bl_logf(LOG_ERROR, "download FAILED: server error %d at %u",
                         (int)peek.error.value, (unsigned)before);
-                bootcom()->magic = 0;
-                g_dronecan.set_node_status_override(
-                    UAVCAN_PROTOCOL_NODESTATUS_HEALTH_ERROR,
-                    UAVCAN_PROTOCOL_NODESTATUS_MODE_MAINTENANCE,
-                    0);
+                abandon_download(UAVCAN_PROTOCOL_NODESTATUS_HEALTH_ERROR);
                 break;
             }
 
@@ -337,7 +346,15 @@ void bl_can_cycle(void)
     if (g_first_reply_pending && millis() - g_download_started_ms > BL_FIRST_REPLY_TIMEOUT_MS) {
         bl_logf(LOG_WARNING, "download: no reply from node %u, waiting for BeginFirmwareUpdate",
                 (unsigned)g_download_server);
-        abandon_download();
+        abandon_download(UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK);
+    }
+    /* A download under way whose server stopped answering: without this the
+       FileRead client retries every 750 ms for ever, in SOFTWARE_UPDATE. */
+    if (!g_first_reply_pending && g_dronecan.firmware_download_active() &&
+        millis() - g_last_progress_ms > BL_STALL_TIMEOUT_MS) {
+        bl_logf(LOG_ERROR, "download: stalled at %u, waiting for BeginFirmwareUpdate",
+                (unsigned)g_dronecan.firmware_download_offset());
+        abandon_download(UAVCAN_PROTOCOL_NODESTATUS_HEALTH_ERROR);
     }
     if (g_dronecan.firmware_download_active()) {
         g_dronecan.send_firmware_read();

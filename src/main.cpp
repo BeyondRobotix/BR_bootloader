@@ -21,33 +21,39 @@
 #include "bootloader_dronecan.h"
 #include "bootloader_flash.h"
 #include "jump.h"
+#include "rtc_boot.h"
 
 static void clear_bootcom_magic()
 {
     bootcom()->magic = 0;
     bootcom()->reserved = 0;
+    bootcom_commit();
 }
 
 /*
- * Snapshot the IWDG reset cause flag and clear all reset flags so the next
- * boot starts fresh. Captured before any other setup so we don't lose the
- * flags to an intervening peripheral init that might clear them. An IWDG
- * reset indicates the previous boot was killed by the watchdog -- treat
- * that as an app crash and stay in the bootloader.
+ * Was this boot caused by the independent watchdog? Read before any other
+ * setup. The flags are left alone when booting the app, so it can see the
+ * watchdog reset too (AP_Periph does); they're cleared only when we hold.
  *
- * Register layout differs between MCU families:
- *   L4: RCC->CSR.IWDGRSTF (bit 29), cleared by writing RMVF
- *   H7: RCC->RSR.IWDG1RSTF (different bit), cleared by writing RMVF
+ *   L4: RCC->CSR.IWDGRSTF, cleared by writing RMVF
+ *   H7: RCC->RSR.IWDG1RSTF, cleared by writing RMVF
  */
-static bool g_app_crashed_via_iwdg;
+static bool g_watchdog_reset;
 
 static void capture_reset_cause()
 {
 #if defined(STM32H7xx) || defined(STM32H7)
-    g_app_crashed_via_iwdg = (RCC->RSR & RCC_RSR_IWDG1RSTF) != 0;
+    g_watchdog_reset = (RCC->RSR & RCC_RSR_IWDG1RSTF) != 0;
+#else
+    g_watchdog_reset = (RCC->CSR & RCC_CSR_IWDGRSTF) != 0;
+#endif
+}
+
+static void clear_reset_flags()
+{
+#if defined(STM32H7xx) || defined(STM32H7)
     RCC->RSR |= RCC_RSR_RMVF;
 #else
-    g_app_crashed_via_iwdg = (RCC->CSR & RCC_CSR_IWDGRSTF) != 0;
     RCC->CSR |= RCC_CSR_RMVF;
 #endif
 }
@@ -76,14 +82,28 @@ void setup()
         bootcom_nid = bc->my_node_id;
     }
 
-    /* Stay in the bootloader if the app explicitly requested it (BOOTCOM)
-       OR if the previous boot died to a watchdog reset (app crash, hang). */
-    const bool stay_in_bootloader = update_requested || g_app_crashed_via_iwdg;
+    /* Boot policy, as AP_Bootloader's. Stay in the bootloader when:
+         - the app handed over an update (BOOTCOM),
+         - RTC_BOOT_HOLD asks us to, or
+         - a watchdog reset hit an app that hadn't yet run for 30 s (no
+           RTC_BOOT_FWOK): a new or broken firmware crashing at start-up,
+           held so it can be replaced over CAN.
+       A watchdog reset of an app that had been running fine boots it
+       straight back up, so a node that resets in flight comes back. The
+       flag is reset every boot; the app sets FWOK again after 30 s.
+       AP_Periph writes it to RTC backup register 0, Arduino-DroneCAN apps to
+       a spare BOOTCOM word; either counts. */
+    const uint32_t rtc_boot = rtc_boot_read();
+    rtc_boot_write(RTC_BOOT_OFF);
+    const bool fw_ok = rtc_boot == RTC_BOOT_FWOK || bootcom_fwok_take() == RTC_BOOT_FWOK;
+    const bool crashed_early = g_watchdog_reset && !fw_ok;
+    const bool stay_in_bootloader = update_requested || rtc_boot == RTC_BOOT_HOLD || crashed_early;
 
     if (!stay_in_bootloader && app_is_valid(APP_START_ADDRESS)) {
         jump_to_app(APP_START_ADDRESS);
         /* jump_to_app returns only if it changed its mind; fall through to CAN. */
     }
+    clear_reset_flags();
 
     /* Take the server and path the app handed over, unless we've already
        acted on this hand-over once (a reset mid-download): then wait for a
@@ -108,7 +128,7 @@ void setup()
        marked as used. */
     clear_bootcom_magic();
 
-    bl_can_start(bootcom_nid, g_app_crashed_via_iwdg);
+    bl_can_start(bootcom_nid, crashed_early);
     if (handover_server != 0) {
         bl_can_start_handover_download(handover_server, handover_path);
     }
