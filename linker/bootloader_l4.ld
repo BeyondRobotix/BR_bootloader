@@ -2,10 +2,11 @@
  * BR_bootloader linker script -- STM32L431 (MicroNode).
  *
  * Layout:
- *   FLASH:   0x08000000, 40 KB  -- bootloader occupies the first 40KB of flash.
- *                                  The application is flashed at 0x0800A000 and
- *                                  must be aligned to a 2KB page boundary so the
- *                                  bootloader pages can be preserved on app erase.
+ *   FLASH:   0x08000000, 36 KB  -- the bootloader. The application is flashed at
+ *                                  0x0800A000 (40 KB). The 4 KB between, pages
+ *                                  18-19 (0x08009000), is AP_Periph's parameter
+ *                                  storage, so the bootloader must never grow
+ *                                  into it: the link fails instead.
  *   BOOTCOM: 0x20000000, 256 B  -- shared IPC region with the application.
  *                                  Layout must match Arduino-DroneCAN's
  *                                  app_bootloader_comms struct and AP_Periph's
@@ -23,7 +24,7 @@ _Min_Stack_Size = 0x400;
 
 MEMORY
 {
-  FLASH   (rx)  : ORIGIN = 0x08000000, LENGTH = 40K
+  FLASH   (rx)  : ORIGIN = 0x08000000, LENGTH = 36K
   BOOTCOM (rw)  : ORIGIN = 0x20000000, LENGTH = 0x100
   RAM    (xrw)  : ORIGIN = 0x20000100, LENGTH = 64K - 0x100
   RAM2   (xrw)  : ORIGIN = 0x10000000, LENGTH = 16K

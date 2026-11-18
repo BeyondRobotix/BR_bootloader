@@ -20,7 +20,16 @@
    used the absolute address and resolved to ~65556 -- wildly out of range --
    which is why every erase path (lib, raw register, HAL) silently failed. */
 #define APP_FIRST_PAGE  ((APP_START_ADDRESS - 0x08000000UL) / BL_FLASH_PAGE_SIZE)
+/* On H7 the app stops where parameter storage begins (STORAGE_FLASH_PAGE,
+   from the board JSON; AP_Periph uses the same sectors), so an oversized or
+   wrong-board image fails rather than erasing the parameters. On L4 the
+   storage is below the app (AP_Periph, pages 18-19) or is the app's own
+   business (Arduino-DroneCAN, pages 126-127), so the app may run to the top. */
+#if (defined(CANH7) || defined(ARDUINO_NUCLEO_H723ZG)) && defined(STORAGE_FLASH_PAGE)
+#define APP_LAST_PAGE   (STORAGE_FLASH_PAGE - 1)
+#else
 #define APP_LAST_PAGE   ((BOARD_FLASH_BYTES / BL_FLASH_PAGE_SIZE) - 1)
+#endif
 #define BL_WRITE_ALIGN  32U
 
 static uint32_t cursor;
@@ -209,6 +218,11 @@ bool bootloader_flash_finalize(void)
 {
     if (!started) {
         fail(BL_FLASH_ERR_FINALIZE);
+        return false;
+    }
+    /* Never commit the vector table over an image with a hole in it: that
+       would make app_is_valid() pass on the next power cycle. */
+    if (failed) {
         return false;
     }
     if (pending_len > 0) {
