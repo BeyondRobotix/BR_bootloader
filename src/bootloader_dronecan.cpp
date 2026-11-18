@@ -17,10 +17,10 @@
 #define LOG_WARNING 2
 #define LOG_ERROR   3
 
-/* How long a hand-over download waits for the server's first reply before
-   giving up and waiting for a BeginFirmwareUpdate instead. The FileRead
-   client retries every 750 ms, so this is several attempts. */
-#define BL_HANDOVER_TIMEOUT_MS 5000
+/* How long a download waits for the server's first reply before giving up
+   and waiting for a BeginFirmwareUpdate instead. The FileRead client
+   retries every 750 ms, so this is several attempts. */
+#define BL_FIRST_REPLY_TIMEOUT_MS 5000
 
 static DroneCAN g_dronecan;
 static bool     g_last_chunk_seen = false;
@@ -28,11 +28,13 @@ static uint32_t g_last_chunk_offset = 0;
 static bl_flash_err_t g_logged_err = BL_FLASH_OK;
 static uint32_t g_last_progress_log_kb = 0;
 
-/* A hand-over download that hasn't had its first reply yet: flash is not
-   armed, and the old app is still intact. */
-static bool     g_handover_pending = false;
-static uint8_t  g_handover_server = 0;
-static uint32_t g_handover_started_ms = 0;
+/* A download that hasn't had its first reply yet: flash is not armed, and
+   the old app is still intact. Applies to both a hand-over and an explicit
+   BeginFirmwareUpdate, so naming a server that never answers costs nothing. */
+static bool     g_first_reply_pending = false;
+static uint8_t  g_download_server = 0;
+static uint32_t g_download_started_ms = 0;
+static char     g_download_path[sizeof(((struct app_bootloader_comms *)0)->path)];
 
 /* Format a short message and broadcast via DroneCAN debug.LogMessage. The
    wire-level limit is ~90 bytes; we cap the buffer well below that. */
@@ -93,7 +95,7 @@ static void log_flash_begin_failure(void)
 static void abandon_download(void)
 {
     g_dronecan.firmware_download_finish();
-    g_handover_pending = false;
+    g_first_reply_pending = false;
     volatile struct app_bootloader_comms *bc = bootcom();
     bc->magic    = 0;
     bc->reserved = 0;
@@ -103,31 +105,43 @@ static void abandon_download(void)
         0);
 }
 
+/* Start reading an image. Flash is armed on the server's first good reply
+   (see the FileRead handler), not here. */
+static void start_download(uint8_t server_node_id, const char *path, uint16_t plen)
+{
+    reset_download_state();
+    memcpy(g_download_path, path, plen);
+    g_download_path[plen] = 0;
+    g_first_reply_pending  = true;
+    g_download_server      = server_node_id;
+    g_download_started_ms  = millis();
+    /* Drop the MAINTENANCE override so the lib's SOFTWARE_UPDATE mode and
+       VSSC=KB progress flow through NodeStatus during the download. */
+    g_dronecan.clear_node_status_override();
+    g_dronecan.begin_firmware_download(server_node_id, g_download_path);
+    mirror_bootcom(server_node_id, g_download_path, plen);
+}
+
 void bl_can_start_handover_download(uint8_t server_node_id, const char *path)
 {
-    uint16_t plen = (uint16_t)strnlen(path, sizeof(bootcom()->path) - 1);
+    uint16_t plen = (uint16_t)strnlen(path, sizeof(g_download_path) - 1);
     bl_logf(LOG_INFO, "hand-over: reading from node %u plen=%u",
             (unsigned)server_node_id, (unsigned)plen);
-    reset_download_state();
-    g_handover_pending    = true;
-    g_handover_server     = server_node_id;
-    g_handover_started_ms = millis();
-    g_dronecan.clear_node_status_override();
-    g_dronecan.begin_firmware_download(server_node_id, path);
-    mirror_bootcom(server_node_id, path, plen);
+    start_download(server_node_id, path, plen);
 }
 
 /*
  * BeginFirmwareUpdate handler (server role).
  *
- * The app-side handler in dronecan.cpp writes BOOTCOM and resets. In the
- * bootloader we are *already* the responder, so we:
- *   - decode the request,
- *   - reply OK,
- *   - prime the lib's FileRead client with (server_node_id, image_path).
+ * The app-side handler writes BOOTCOM and resets; in the bootloader we are
+ * the responder, so we decode the request, reply, and start reading the
+ * image. Flash isn't touched until the server's first good reply, so the
+ * reply goes out at once (no H7 sector erase first) and a server that never
+ * answers leaves the old app intact.
  *
- * Subsequent bl_can_cycle() calls drive send_firmware_read(), and chunks
- * are persisted via the firmware_write_cb registered in bl_can_start().
+ * A repeat of the request already being served (the DroneCAN GUI tool sends
+ * it up to four times) gets ERROR_IN_PROGRESS rather than restarting the
+ * download, as with AP_Bootloader.
  */
 static void handle_begin_firmware_update_server(CanardInstance *ins, CanardRxTransfer *transfer)
 {
@@ -137,32 +151,29 @@ static void handle_begin_firmware_update_server(CanardInstance *ins, CanardRxTra
         return;
     }
 
-    bl_logf(LOG_INFO, "BeginFirmwareUpdate src=%u plen=%u",
-            (unsigned)transfer->source_node_id,
-            (unsigned)req.image_file_remote_path.path.len);
+    /* Per req.source_node_id semantics, the server may delegate to a third
+       node; fall back to the request originator if not specified. */
+    uint8_t server = req.source_node_id ? req.source_node_id : transfer->source_node_id;
 
-    /* An explicit request replaces any hand-over download still waiting for
-       its first reply. */
-    g_handover_pending = false;
-
-    /* Arm flash state first; if the page erase fails we surface the error in
-       the response instead of silently dropping every chunk that follows. */
-    bool flash_ready = bootloader_flash_begin();
-    reset_download_state();
-
-    if (flash_ready) {
-        /* Drop MAINTENANCE override so the lib's SOFTWARE_UPDATE mode +
-           VSSC=KB progress flows through NodeStatus during the download. */
-        g_dronecan.clear_node_status_override();
-        bl_logf(LOG_INFO, "flash begin OK, starting download");
-    } else {
-        log_flash_begin_failure();
+    char path[sizeof(g_download_path)];
+    uint16_t plen = req.image_file_remote_path.path.len;
+    if (plen > sizeof(path) - 1) {
+        plen = sizeof(path) - 1;
     }
+    memcpy(path, req.image_file_remote_path.path.data, plen);
+    path[plen] = 0;
+
+    const bool repeat = g_dronecan.firmware_download_active() &&
+                        server == g_download_server && strcmp(path, g_download_path) == 0;
+
+    bl_logf(LOG_INFO, "BeginFirmwareUpdate src=%u plen=%u%s",
+            (unsigned)transfer->source_node_id, (unsigned)plen,
+            repeat ? " (already in progress)" : "");
 
     uavcan_protocol_file_BeginFirmwareUpdateResponse reply{};
-    reply.error = flash_ready
-        ? UAVCAN_PROTOCOL_FILE_BEGINFIRMWAREUPDATE_RESPONSE_ERROR_OK
-        : UAVCAN_PROTOCOL_FILE_BEGINFIRMWAREUPDATE_RESPONSE_ERROR_UNKNOWN;
+    reply.error = repeat
+        ? UAVCAN_PROTOCOL_FILE_BEGINFIRMWAREUPDATE_RESPONSE_ERROR_IN_PROGRESS
+        : UAVCAN_PROTOCOL_FILE_BEGINFIRMWAREUPDATE_RESPONSE_ERROR_OK;
     uint8_t buf[UAVCAN_PROTOCOL_FILE_BEGINFIRMWAREUPDATE_RESPONSE_MAX_SIZE];
     uint16_t len = uavcan_protocol_file_BeginFirmwareUpdateResponse_encode(&reply, buf);
 
@@ -177,26 +188,9 @@ static void handle_begin_firmware_update_server(CanardInstance *ins, CanardRxTra
     };
     canardRequestOrRespondObj(ins, transfer->source_node_id, &reply_xfer);
 
-    /* If flash erase failed, don't start the FileRead client -- the bootloader
-       will stay alive on the bus so the operator can see it and retry. */
-    if (!flash_ready) {
-        return;
+    if (!repeat) {
+        start_download(server, path, plen);
     }
-
-    /* Per req.source_node_id semantics, the server may delegate to a third
-       node; fall back to the request originator if not specified. */
-    uint8_t server = req.source_node_id ? req.source_node_id : transfer->source_node_id;
-
-    char path[201];
-    uint16_t plen = req.image_file_remote_path.path.len;
-    if (plen > sizeof(path) - 1) {
-        plen = sizeof(path) - 1;
-    }
-    memcpy(path, req.image_file_remote_path.path.data, plen);
-    path[plen] = 0;
-
-    g_dronecan.begin_firmware_download(server, path);
-    mirror_bootcom(server, path, plen);
 }
 
 /*
@@ -227,25 +221,25 @@ static void bl_on_transfer_received(CanardInstance *ins, CanardRxTransfer *trans
             bool decode_ok = (uavcan_protocol_file_ReadResponse_decode(transfer, &peek) == 0);
             const bool read_ok = decode_ok && peek.error.value == UAVCAN_PROTOCOL_FILE_ERROR_OK;
 
-            /* First reply to a hand-over download: only now erase the old
+            /* First reply to a download: only now erase the old
                app, so a server that never answers costs nothing. */
-            if (g_handover_pending) {
-                if (!decode_ok || transfer->source_node_id != g_handover_server) {
+            if (g_first_reply_pending) {
+                if (!decode_ok || transfer->source_node_id != g_download_server) {
                     break;
                 }
                 if (!read_ok) {
-                    bl_logf(LOG_WARNING, "hand-over: server error %d, waiting for BeginFirmwareUpdate",
+                    bl_logf(LOG_WARNING, "download: server error %d, waiting for BeginFirmwareUpdate",
                             (int)peek.error.value);
                     abandon_download();
                     break;
                 }
-                g_handover_pending = false;
+                g_first_reply_pending = false;
                 if (!bootloader_flash_begin()) {
                     log_flash_begin_failure();
                     g_dronecan.firmware_download_finish();
                     break;
                 }
-                bl_logf(LOG_INFO, "hand-over: server answered, flashing");
+                bl_logf(LOG_INFO, "download: server answered, flashing");
             }
 
             const bool was_active = g_dronecan.firmware_download_active();
@@ -340,9 +334,9 @@ void bl_can_start(uint8_t preferred_node_id, bool iwdg_reset)
 void bl_can_cycle(void)
 {
     g_dronecan.cycle();
-    if (g_handover_pending && millis() - g_handover_started_ms > BL_HANDOVER_TIMEOUT_MS) {
-        bl_logf(LOG_WARNING, "hand-over: no reply from node %u, waiting for BeginFirmwareUpdate",
-                (unsigned)g_handover_server);
+    if (g_first_reply_pending && millis() - g_download_started_ms > BL_FIRST_REPLY_TIMEOUT_MS) {
+        bl_logf(LOG_WARNING, "download: no reply from node %u, waiting for BeginFirmwareUpdate",
+                (unsigned)g_download_server);
         abandon_download();
     }
     if (g_dronecan.firmware_download_active()) {
