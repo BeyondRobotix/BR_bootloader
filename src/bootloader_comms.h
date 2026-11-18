@@ -13,6 +13,14 @@
 #define APP_BOOTLOADER_COMMS_MAGIC 0xc544ad9a
 #define BOOTCOM_ADDR               0x20000000UL
 
+/* Written to `reserved` once the bootloader has acted on a hand-over, so a
+   reset mid-download doesn't start the same download again on every boot.
+   Both AP_Periph and Arduino-DroneCAN zero the whole struct before a
+   hand-over whenever `magic` isn't already set, and the bootloader always
+   clears `magic` before jumping, so a fresh hand-over has reserved == 0.
+   Neither app reads the field. */
+#define BOOTCOM_HANDOVER_USED      0x55534544UL  /* "USED" */
+
 struct app_bootloader_comms {
     uint32_t magic;
     uint32_t ip;

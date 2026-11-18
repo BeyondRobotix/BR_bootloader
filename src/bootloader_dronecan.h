@@ -34,6 +34,15 @@ extern "C" {
 void bl_can_start(uint8_t preferred_node_id, bool iwdg_reset);
 void bl_can_cycle(void);
 
+/*
+ * Start reading the image from the server and path the app handed over in
+ * BOOTCOM, so one BeginFirmwareUpdate sent to the app is enough (as with
+ * AP_Bootloader). Flash isn't touched until the server's first good reply,
+ * so if it never answers (BL_HANDOVER_TIMEOUT_MS) the old app is intact and
+ * the bootloader goes back to waiting for a BeginFirmwareUpdate.
+ */
+void bl_can_start_handover_download(uint8_t server_node_id, const char *path);
+
 /* True once a download has completed (server returned a short/empty chunk). */
 bool bl_can_update_done(void);
 

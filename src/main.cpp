@@ -3,8 +3,10 @@
  *
  * Boot flow:
  *   1. If BOOTCOM magic is present, the app requested an update -> stay in
- *      the bootloader, reuse the node ID it left for us, and immediately
- *      bring CAN up so the GCS can re-deliver BeginFirmwareUpdate.
+ *      the bootloader, reuse the node ID it left for us, bring CAN up and
+ *      start reading the image from the server and path the app handed
+ *      over (as AP_Bootloader does). If that server doesn't answer, fall
+ *      back to waiting for a BeginFirmwareUpdate.
  *   2. Otherwise, if a valid app vector table exists -> jump to app.
  *   3. Otherwise, bring CAN up (DNA from scratch) so the bootloader is
  *      discoverable and recoverable from a totally-empty board.
@@ -23,6 +25,7 @@
 static void clear_bootcom_magic()
 {
     bootcom()->magic = 0;
+    bootcom()->reserved = 0;
 }
 
 /*
@@ -82,12 +85,33 @@ void setup()
         /* jump_to_app returns only if it changed its mind; fall through to CAN. */
     }
 
+    /* Take the server and path the app handed over, unless we've already
+       acted on this hand-over once (a reset mid-download): then wait for a
+       fresh BeginFirmwareUpdate rather than retrying on every boot. */
+    uint8_t handover_server = 0;
+    char handover_path[sizeof(bc->path)] = {0};
+    if (update_requested && bc->reserved != BOOTCOM_HANDOVER_USED &&
+        bc->server_node_id > 0 && bc->server_node_id <= 127) {
+        size_t n = 0;
+        while (n < sizeof(handover_path) - 1 && bc->path[n] != 0) {
+            handover_path[n] = (char)bc->path[n];
+            n++;
+        }
+        handover_path[n] = 0;
+        if (n > 0) {
+            handover_server = bc->server_node_id;
+        }
+    }
+
     /* Consume the request so a watchdog reboot during a stalled update
-       eventually returns to normal boot. The new BeginFirmwareUpdate from
-       the GCS will re-set it. */
+       eventually returns to normal boot. Starting a download re-sets it,
+       marked as used. */
     clear_bootcom_magic();
 
     bl_can_start(bootcom_nid, g_app_crashed_via_iwdg);
+    if (handover_server != 0) {
+        bl_can_start_handover_download(handover_server, handover_path);
+    }
 }
 
 /*
