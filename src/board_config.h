@@ -16,8 +16,7 @@
 
 /* STM32L431 (MicroNode) ----------------------------------------------------*/
 
-/* Bootloader occupies the first 40 KB of flash; app starts on the next 2 KB
-   page boundary so the bootloader is safe to leave in place during app erase. */
+/* 36 KB bootloader + 4 KB AP_Periph parameter storage precede the app. */
 #define APP_START_ADDRESS   0x0800A000UL
 #define BL_FLASH_PAGE_SIZE  0x800UL          /* 2 KB pages on L4 */
 #define BOARD_FLASH_BYTES   (256UL * 1024UL) /* L431CC */

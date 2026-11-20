@@ -11,39 +11,35 @@
 
 #define BOOTLOADER_NODE_NAME "org.beyondrobotix.bootloader"
 
-/* DroneCAN LogMessage level constants -- match uavcan.protocol.debug.LogLevel. */
+/* uavcan.protocol.debug.LogLevel values. */
 #define LOG_DEBUG   0
 #define LOG_INFO    1
 #define LOG_WARNING 2
 #define LOG_ERROR   3
 
-/* How long a download waits for the server's first reply before giving up
-   and waiting for a BeginFirmwareUpdate instead. The FileRead client
-   retries every 750 ms, so this is several attempts. */
 #define BL_FIRST_REPLY_TIMEOUT_MS 5000
-
-/* How long a download that has started may go without progress before it's
-   abandoned. The old app is already partly erased by then, so the bootloader
-   reports ERROR and waits for a fresh BeginFirmwareUpdate. */
 #define BL_STALL_TIMEOUT_MS 10000
 
+enum class DownloadPhase {
+    Idle,
+    AwaitingFirstReply,
+    Receiving,
+    EofReceived,
+};
+
+struct DownloadState {
+    DownloadPhase phase = DownloadPhase::Idle;
+    uint8_t server_node_id = 0;
+    uint32_t started_ms = 0;
+    uint32_t last_progress_ms = 0;
+    uint32_t last_progress_log_kb = 0;
+    bl_flash_err_t logged_flash_error = BL_FLASH_OK;
+    char path[sizeof(((struct app_bootloader_comms *)0)->path)] = {};
+};
+
 static DroneCAN g_dronecan;
-static bool     g_last_chunk_seen = false;
-static uint32_t g_last_chunk_offset = 0;
-static bl_flash_err_t g_logged_err = BL_FLASH_OK;
-static uint32_t g_last_progress_log_kb = 0;
+static DownloadState g_download;
 
-/* A download that hasn't had its first reply yet: flash is not armed, and
-   the old app is still intact. Applies to both a hand-over and an explicit
-   BeginFirmwareUpdate, so naming a server that never answers costs nothing. */
-static bool     g_first_reply_pending = false;
-static uint8_t  g_download_server = 0;
-static uint32_t g_download_started_ms = 0;
-static uint32_t g_last_progress_ms = 0;
-static char     g_download_path[sizeof(((struct app_bootloader_comms *)0)->path)];
-
-/* Format a short message and broadcast via DroneCAN debug.LogMessage. The
-   wire-level limit is ~90 bytes; we cap the buffer well below that. */
 static void bl_logf(uint8_t level, const char *fmt, ...)
 {
     char msg[80];
@@ -54,17 +50,7 @@ static void bl_logf(uint8_t level, const char *fmt, ...)
     g_dronecan.debug(msg, level);
 }
 
-/* Reset per-download bookkeeping. */
-static void reset_download_state(void)
-{
-    g_last_chunk_seen      = false;
-    g_last_chunk_offset    = 0;
-    g_last_progress_log_kb = 0;
-    g_logged_err           = BL_FLASH_OK;
-}
-
-/* Record the download in BOOTCOM so a watchdog/reset mid-update stays in
-   the bootloader, marked used so that boot doesn't start it again. */
+/* A reset must hold in the bootloader without automatically retrying the image. */
 static void mirror_bootcom(uint8_t server, const char *path, uint16_t plen)
 {
     volatile struct app_bootloader_comms *bc = bootcom();
@@ -77,15 +63,12 @@ static void mirror_bootcom(uint8_t server, const char *path, uint16_t plen)
     bootcom_commit();
 }
 
-/* Log why flash couldn't be armed. */
 static void log_flash_begin_failure(void)
 {
     bl_logf(LOG_ERROR, "flash begin FAILED err=%u",
             (unsigned)bootloader_flash_last_error());
     struct bl_flash_diag d;
     bootloader_flash_get_diag(&d);
-    /* Top byte of ACR is repurposed as a path tag: 0xAA=raw worked,
-       0xBB=HAL worked, 0xFF=neither (and that's why we're here). */
     bl_logf(LOG_ERROR, "FLASH sr=%08lx cr=%08lx",
             (unsigned long)d.sr, (unsigned long)d.cr);
     bl_logf(LOG_ERROR, "OPTR=%08lx WRP1A=%08lx WRP1B=%08lx",
@@ -98,12 +81,10 @@ static void log_flash_begin_failure(void)
             (unsigned long)d.acr);
 }
 
-/* Give up on a download and show the bootloader as waiting again: health OK
-   if flash was never touched, ERROR if the old app is partly erased. */
 static void abandon_download(uint8_t health)
 {
     g_dronecan.firmware_download_finish();
-    g_first_reply_pending = false;
+    g_download.phase = DownloadPhase::Idle;
     volatile struct app_bootloader_comms *bc = bootcom();
     bc->magic    = 0;
     bc->reserved = 0;
@@ -114,45 +95,30 @@ static void abandon_download(uint8_t health)
         0);
 }
 
-/* Start reading an image. Flash is armed on the server's first good reply
-   (see the FileRead handler), not here. */
 static void start_download(uint8_t server_node_id, const char *path, uint16_t plen)
 {
-    reset_download_state();
-    memcpy(g_download_path, path, plen);
-    g_download_path[plen] = 0;
-    g_first_reply_pending  = true;
-    g_download_server      = server_node_id;
-    g_download_started_ms  = millis();
-    g_last_progress_ms     = g_download_started_ms;
-    /* Drop the MAINTENANCE override so the lib's SOFTWARE_UPDATE mode and
-       VSSC=KB progress flow through NodeStatus during the download. */
+    g_download.phase = DownloadPhase::AwaitingFirstReply;
+    g_download.last_progress_log_kb = 0;
+    g_download.logged_flash_error = BL_FLASH_OK;
+    memcpy(g_download.path, path, plen);
+    g_download.path[plen] = 0;
+    g_download.server_node_id = server_node_id;
+    g_download.started_ms = millis();
+    g_download.last_progress_ms = g_download.started_ms;
+    /* Let the library report SOFTWARE_UPDATE and progress in KB. */
     g_dronecan.clear_node_status_override();
-    g_dronecan.begin_firmware_download(server_node_id, g_download_path);
-    mirror_bootcom(server_node_id, g_download_path, plen);
+    g_dronecan.begin_firmware_download(server_node_id, g_download.path);
+    mirror_bootcom(server_node_id, g_download.path, plen);
 }
 
 void bl_can_start_handover_download(uint8_t server_node_id, const char *path)
 {
-    uint16_t plen = (uint16_t)strnlen(path, sizeof(g_download_path) - 1);
+    uint16_t plen = (uint16_t)strnlen(path, sizeof(g_download.path) - 1);
     bl_logf(LOG_INFO, "hand-over: reading from node %u plen=%u",
             (unsigned)server_node_id, (unsigned)plen);
     start_download(server_node_id, path, plen);
 }
 
-/*
- * BeginFirmwareUpdate handler (server role).
- *
- * The app-side handler writes BOOTCOM and resets; in the bootloader we are
- * the responder, so we decode the request, reply, and start reading the
- * image. Flash isn't touched until the server's first good reply, so the
- * reply goes out at once (no H7 sector erase first) and a server that never
- * answers leaves the old app intact.
- *
- * A repeat of the request already being served (the DroneCAN GUI tool sends
- * it up to four times) gets ERROR_IN_PROGRESS rather than restarting the
- * download, as with AP_Bootloader.
- */
 static void handle_begin_firmware_update_server(CanardInstance *ins, CanardRxTransfer *transfer)
 {
     uavcan_protocol_file_BeginFirmwareUpdateRequest req;
@@ -161,11 +127,9 @@ static void handle_begin_firmware_update_server(CanardInstance *ins, CanardRxTra
         return;
     }
 
-    /* Per req.source_node_id semantics, the server may delegate to a third
-       node; fall back to the request originator if not specified. */
     uint8_t server = req.source_node_id ? req.source_node_id : transfer->source_node_id;
 
-    char path[sizeof(g_download_path)];
+    char path[sizeof(g_download.path)];
     uint16_t plen = req.image_file_remote_path.path.len;
     if (plen > sizeof(path) - 1) {
         plen = sizeof(path) - 1;
@@ -174,7 +138,7 @@ static void handle_begin_firmware_update_server(CanardInstance *ins, CanardRxTra
     path[plen] = 0;
 
     const bool repeat = g_dronecan.firmware_download_active() &&
-                        server == g_download_server && strcmp(path, g_download_path) == 0;
+                        server == g_download.server_node_id && strcmp(path, g_download.path) == 0;
 
     bl_logf(LOG_INFO, "BeginFirmwareUpdate src=%u plen=%u%s",
             (unsigned)transfer->source_node_id, (unsigned)plen,
@@ -203,11 +167,75 @@ static void handle_begin_firmware_update_server(CanardInstance *ins, CanardRxTra
     }
 }
 
-/*
- * Custom dispatcher. Routes the small set of services the bootloader cares
- * about; everything else is ignored (lighter than pulling in the full app-side
- * dispatcher's param/restart handlers).
- */
+static void handle_file_read_response(CanardRxTransfer *transfer)
+{
+    uavcan_protocol_file_ReadResponse response;
+    const bool decode_ok = uavcan_protocol_file_ReadResponse_decode(transfer, &response) == 0;
+    const bool read_ok = decode_ok && response.error.value == UAVCAN_PROTOCOL_FILE_ERROR_OK;
+
+    /* Preserve the old app until the server's first successful reply. */
+    if (g_download.phase == DownloadPhase::AwaitingFirstReply) {
+        if (!decode_ok || transfer->source_node_id != g_download.server_node_id) {
+            return;
+        }
+        if (!read_ok) {
+            bl_logf(LOG_WARNING, "download: server error %d, waiting for BeginFirmwareUpdate",
+                    (int)response.error.value);
+            abandon_download(UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK);
+            return;
+        }
+        g_download.phase = DownloadPhase::Receiving;
+        if (!bootloader_flash_begin()) {
+            log_flash_begin_failure();
+            g_dronecan.firmware_download_finish();
+            g_download.phase = DownloadPhase::Idle;
+            return;
+        }
+        bl_logf(LOG_INFO, "download: server answered, flashing");
+    }
+
+    const bool was_active = g_dronecan.firmware_download_active();
+    const uint32_t offset_before = g_dronecan.firmware_download_offset();
+
+    g_dronecan.handle_file_read_response(transfer);
+
+    const uint32_t offset_after = g_dronecan.firmware_download_offset();
+    if (offset_after != offset_before) {
+        g_download.last_progress_ms = millis();
+    }
+
+    if (decode_ok && !read_ok && was_active && !g_dronecan.firmware_download_active()) {
+        bl_logf(LOG_ERROR, "download FAILED: server error %d at %u",
+                (int)response.error.value, (unsigned)offset_before);
+        abandon_download(UAVCAN_PROTOCOL_NODESTATUS_HEALTH_ERROR);
+        return;
+    }
+
+    const uint32_t progress_kb = offset_after / 1024;
+    if (progress_kb >= g_download.last_progress_log_kb + 8) {
+        g_download.last_progress_log_kb = progress_kb;
+        bl_logf(LOG_DEBUG, "rx %u KB written=%u",
+                (unsigned)progress_kb,
+                (unsigned)bootloader_flash_bytes_written());
+    }
+
+    /* Only accepted short chunks signal EOF; ignored replies must not commit an image. */
+    const bool accepted = read_ok && (offset_after - offset_before) == response.data.len;
+    if (accepted && response.data.len < 256) {
+        const bool finalized = bootloader_flash_finalize();
+        g_download.phase = DownloadPhase::EofReceived;
+        g_dronecan.firmware_download_finish();
+        if (finalized && !bootloader_flash_failed()) {
+            bl_logf(LOG_INFO, "download done bytes=%u",
+                    (unsigned)bootloader_flash_bytes_written());
+        } else {
+            bl_logf(LOG_ERROR, "download FAILED err=%u after=%u",
+                    (unsigned)bootloader_flash_last_error(),
+                    (unsigned)offset_after);
+        }
+    }
+}
+
 static void bl_on_transfer_received(CanardInstance *ins, CanardRxTransfer *transfer)
 {
     switch (transfer->transfer_type) {
@@ -227,109 +255,26 @@ static void bl_on_transfer_received(CanardInstance *ins, CanardRxTransfer *trans
 
     case CanardTransferTypeResponse:
         if (transfer->data_type_id == UAVCAN_PROTOCOL_FILE_READ_ID) {
-            uavcan_protocol_file_ReadResponse peek;
-            bool decode_ok = (uavcan_protocol_file_ReadResponse_decode(transfer, &peek) == 0);
-            const bool read_ok = decode_ok && peek.error.value == UAVCAN_PROTOCOL_FILE_ERROR_OK;
-
-            /* First reply to a download: only now erase the old
-               app, so a server that never answers costs nothing. */
-            if (g_first_reply_pending) {
-                if (!decode_ok || transfer->source_node_id != g_download_server) {
-                    break;
-                }
-                if (!read_ok) {
-                    bl_logf(LOG_WARNING, "download: server error %d, waiting for BeginFirmwareUpdate",
-                            (int)peek.error.value);
-                    abandon_download(UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK);
-                    break;
-                }
-                g_first_reply_pending = false;
-                if (!bootloader_flash_begin()) {
-                    log_flash_begin_failure();
-                    g_dronecan.firmware_download_finish();
-                    break;
-                }
-                bl_logf(LOG_INFO, "download: server answered, flashing");
-            }
-
-            const bool was_active = g_dronecan.firmware_download_active();
-            uint32_t before = g_dronecan.firmware_download_offset();
-
-            g_dronecan.handle_file_read_response(transfer);
-
-            uint32_t after = g_dronecan.firmware_download_offset();
-            if (after != before) {
-                g_last_progress_ms = millis();
-            }
-
-            /* The server reported an error and the client gave up: the old
-               app may already be partly erased, so say so rather than sit
-               in SOFTWARE_UPDATE looking busy. */
-            if (decode_ok && !read_ok && was_active && !g_dronecan.firmware_download_active()) {
-                bl_logf(LOG_ERROR, "download FAILED: server error %d at %u",
-                        (int)peek.error.value, (unsigned)before);
-                abandon_download(UAVCAN_PROTOCOL_NODESTATUS_HEALTH_ERROR);
-                break;
-            }
-
-            /* progress log every 8 KB so the bus isn't drowned in chatter */
-            uint32_t kb = after / 1024;
-            if (kb >= g_last_progress_log_kb + 8) {
-                g_last_progress_log_kb = kb;
-                bl_logf(LOG_DEBUG, "rx %u KB written=%u",
-                        (unsigned)kb,
-                        (unsigned)bootloader_flash_bytes_written());
-            }
-
-            /* A short chunk (< 256B) signals EOF in DroneCAN FileRead, but
-               only one the client accepted: a reply it ignored (a late
-               answer to a retried read, or another node's) leaves the offset
-               where it was, and taking that as EOF would commit a partial
-               image. */
-            const bool accepted = read_ok && (after - before) == peek.data.len;
-            if (accepted && peek.data.len < 256) {
-                bool fin_ok = bootloader_flash_finalize();
-                g_last_chunk_offset = after;
-                g_last_chunk_seen   = true;
-                g_dronecan.firmware_download_finish();
-                if (fin_ok && !bootloader_flash_failed()) {
-                    bl_logf(LOG_INFO, "download done bytes=%u",
-                            (unsigned)bootloader_flash_bytes_written());
-                } else {
-                    bl_logf(LOG_ERROR, "download FAILED err=%u after=%u",
-                            (unsigned)bootloader_flash_last_error(),
-                            (unsigned)after);
-                }
-            }
+            handle_file_read_response(transfer);
         }
         break;
     }
 }
 
-/* libcanard adapter -> our dispatcher, using user_reference for context. */
-static void canard_dispatch(CanardInstance *ins, CanardRxTransfer *transfer)
-{
-    bl_on_transfer_received(ins, transfer);
-}
-
 void bl_can_start(uint8_t preferred_node_id, bool iwdg_reset)
 {
     g_dronecan.version_major = 0;
-    g_dronecan.version_minor = 4;  /* Phase 4 */
+    g_dronecan.version_minor = 4;
 
     g_dronecan.set_firmware_write_callback(bootloader_flash_write_cb);
-    /* Take over the LED so main.cpp can render heartbeat / progress / error
-       patterns without fighting the lib's 1 Hz cycle-toggle. */
+    /* main.cpp owns the LED patterns. */
     g_dronecan.set_cycle_led_pin(-1);
 
-    g_dronecan.init(canard_dispatch,
+    g_dronecan.init(bl_on_transfer_received,
                     DroneCANshouldAcceptTransfer,
                     BOOTLOADER_NODE_NAME,
                     preferred_node_id);
 
-    /* Flag the bootloader as "not the app" in the GCS node list as soon as
-       NodeStatus starts going out. Cleared when an update download begins
-       so the lib's SOFTWARE_UPDATE / VSSC-progress reporting takes over. */
     g_dronecan.set_node_status_override(
         UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK,
         UAVCAN_PROTOCOL_NODESTATUS_MODE_MAINTENANCE,
@@ -343,15 +288,15 @@ void bl_can_start(uint8_t preferred_node_id, bool iwdg_reset)
 void bl_can_cycle(void)
 {
     g_dronecan.cycle();
-    if (g_first_reply_pending && millis() - g_download_started_ms > BL_FIRST_REPLY_TIMEOUT_MS) {
+    if (g_download.phase == DownloadPhase::AwaitingFirstReply &&
+        millis() - g_download.started_ms > BL_FIRST_REPLY_TIMEOUT_MS) {
         bl_logf(LOG_WARNING, "download: no reply from node %u, waiting for BeginFirmwareUpdate",
-                (unsigned)g_download_server);
+                (unsigned)g_download.server_node_id);
         abandon_download(UAVCAN_PROTOCOL_NODESTATUS_HEALTH_OK);
     }
-    /* A download under way whose server stopped answering: without this the
-       FileRead client retries every 750 ms for ever, in SOFTWARE_UPDATE. */
-    if (!g_first_reply_pending && g_dronecan.firmware_download_active() &&
-        millis() - g_last_progress_ms > BL_STALL_TIMEOUT_MS) {
+    if (g_download.phase != DownloadPhase::AwaitingFirstReply &&
+        g_dronecan.firmware_download_active() &&
+        millis() - g_download.last_progress_ms > BL_STALL_TIMEOUT_MS) {
         bl_logf(LOG_ERROR, "download: stalled at %u, waiting for BeginFirmwareUpdate",
                 (unsigned)g_dronecan.firmware_download_offset());
         abandon_download(UAVCAN_PROTOCOL_NODESTATUS_HEALTH_ERROR);
@@ -360,20 +305,14 @@ void bl_can_cycle(void)
         g_dronecan.send_firmware_read();
     }
 
-    /* Report a flash failure the first time we observe it. The failure may
-       have been set deep inside the write callback (handle_file_read_response
-       chain) where calling debug() would re-enter the canard tx queue --
-       better to surface it here, after the response transfer is fully drained. */
+    /* Log outside the flash callback to avoid re-entering the canard TX queue. */
     bl_flash_err_t err = bootloader_flash_last_error();
-    if (err != BL_FLASH_OK && err != g_logged_err) {
-        g_logged_err = err;
+    if (err != BL_FLASH_OK && err != g_download.logged_flash_error) {
+        g_download.logged_flash_error = err;
         bl_logf(LOG_ERROR, "flash op FAILED err=%u written=%u",
                 (unsigned)err,
                 (unsigned)bootloader_flash_bytes_written());
 
-        /* Flag the failure in NodeStatus so the GCS node list shows ERROR
-           health and MAINTENANCE mode instead of looking healthy while
-           silently refusing to jump. VSSC carries the error code. */
         g_dronecan.set_node_status_override(
             UAVCAN_PROTOCOL_NODESTATUS_HEALTH_ERROR,
             UAVCAN_PROTOCOL_NODESTATUS_MODE_MAINTENANCE,
@@ -383,10 +322,7 @@ void bl_can_cycle(void)
 
 bool bl_can_update_done(void)
 {
-    /* "Done" only if we saw EOF *and* every flash op along the way succeeded.
-       If a write was dropped, we'd otherwise jump to the still-intact old
-       vector table and the old firmware would run, masking the failure. */
-    return g_last_chunk_seen && !bootloader_flash_failed();
+    return g_download.phase == DownloadPhase::EofReceived && !bootloader_flash_failed();
 }
 
 bool bl_can_update_failed(void)
@@ -396,5 +332,5 @@ bool bl_can_update_failed(void)
 
 bool bl_can_update_in_progress(void)
 {
-    return g_dronecan.firmware_download_active() || g_last_chunk_seen;
+    return g_dronecan.firmware_download_active() || g_download.phase == DownloadPhase::EofReceived;
 }

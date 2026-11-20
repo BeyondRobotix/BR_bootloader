@@ -3,33 +3,14 @@
 #include <flash.h>
 #include <string.h>
 
-/*
- * Internal state for an in-progress image write.
- *   cursor      -- next absolute flash address to write
- *   pending_*   -- short tail buffer for sub-aligned chunks
- *   highest_page_erased -- so we erase each app page exactly once
- *   started     -- gate begin() / write() ordering
- *
- * Write granule: 32 bytes (256 bits). This is the H7 minimum; L4 only needs
- * 8 bytes but accepts any 8-byte multiple, so 32-byte alignment is safe for
- * both. Universal alignment simplifies the code at a cost of up to ~31 bytes
- * of 0xFF padding at the end of the image.
- */
-/* Page numbers are zero-based from the flash base (0x08000000), so the app
-   start needs the flash base subtracted before dividing. The original macro
-   used the absolute address and resolved to ~65556 -- wildly out of range --
-   which is why every erase path (lib, raw register, HAL) silently failed. */
 #define APP_FIRST_PAGE  ((APP_START_ADDRESS - 0x08000000UL) / BL_FLASH_PAGE_SIZE)
-/* On H7 the app stops where parameter storage begins (STORAGE_FLASH_PAGE,
-   from the board JSON; AP_Periph uses the same sectors), so an oversized or
-   wrong-board image fails rather than erasing the parameters. On L4 the
-   storage is below the app (AP_Periph, pages 18-19) or is the app's own
-   business (Arduino-DroneCAN, pages 126-127), so the app may run to the top. */
+/* H7 parameter sectors are outside the writable app region. */
 #if (defined(CANH7) || defined(ARDUINO_NUCLEO_H723ZG)) && defined(STORAGE_FLASH_PAGE)
 #define APP_LAST_PAGE   (STORAGE_FLASH_PAGE - 1)
 #else
 #define APP_LAST_PAGE   ((BOARD_FLASH_BYTES / BL_FLASH_PAGE_SIZE) - 1)
 #endif
+/* H7 requires 32-byte writes; L4 accepts multiples of 8 bytes. */
 #define BL_WRITE_ALIGN  32U
 
 static uint32_t cursor;
@@ -42,21 +23,8 @@ static uint32_t bytes_written;
 static bl_flash_err_t last_err = BL_FLASH_OK;
 static struct bl_flash_diag diag;
 
-/* Deferred vector-table write. The image's first 8 bytes (initial SP +
-   reset_handler) are what app_is_valid() looks at -- if a power-loss leaves
-   those bytes valid but the rest of the image incomplete, the bootloader
-   would jump to broken code on the next boot.
- *
- * We defer the entire first 32-byte write granule (not just 8 bytes), for
- * two reasons:
- *   1. On H7, stm32_flash_write rejects re-programming partially-programmed
- *      memory (check_all_ones gate). If we wrote bytes 8-31 of the image
- *      during streaming, a later 32-byte write at the same address would
- *      fail. By deferring all 32 bytes, the first block stays erased (0xFF)
- *      until finalize.
- *   2. The L4 write path's skip-if-matched optimization makes writing 0xFF
- *      to an erased cell a no-op, so this has zero cost on both families.
- */
+/* Keep the vector table erased until finalize so interrupted images cannot boot.
+   Defer the whole granule: H7 cannot reprogram a partially written granule. */
 static uint8_t  deferred_vt[BL_WRITE_ALIGN];
 static bool     deferred_vt_armed;
 
@@ -71,7 +39,6 @@ static bool     deferred_vt_armed;
 #define BL_FLASH_WRP1BR  (*(volatile uint32_t *)(BL_FLASH_BASE + 0x30))
 #define BL_FLASH_PCROP1SR (*(volatile uint32_t *)(BL_FLASH_BASE + 0x24))
 #define BL_FLASH_PCROP1ER (*(volatile uint32_t *)(BL_FLASH_BASE + 0x28))
-
 
 static void capture_diag(void)
 {
@@ -118,7 +85,6 @@ static bool ensure_page_erased(uint32_t addr)
 
 static bool flush_aligned(const uint8_t *src, uint32_t len)
 {
-    /* len is a multiple of BL_WRITE_ALIGN here. Erase any pages we're about to touch. */
     uint32_t remaining = len;
     uint32_t addr      = cursor;
     const uint8_t *p   = src;
@@ -188,11 +154,7 @@ bool bootloader_flash_write(uint32_t offset, const uint8_t *data, uint16_t len)
     memcpy(buf, pending, pending_len);
     memcpy(buf + pending_len, data, len);
 
-    /* Deferred VT: if this chunk contains the image's first write-granule,
-       stash the bytes and substitute 0xFF in the buffer we're about to
-       flash. offset==0 is sufficient because writes are strictly append-only
-       (asserted by the expected_offset gate above) -- the first BL_WRITE_ALIGN
-       bytes can only ever appear in the very first chunk. */
+    /* The flash primitives skip matching 0xFF, leaving this granule erased. */
     if (!deferred_vt_armed && offset == 0 && total >= BL_WRITE_ALIGN) {
         memcpy(deferred_vt, buf, BL_WRITE_ALIGN);
         memset(buf, 0xFF, BL_WRITE_ALIGN);
@@ -202,11 +164,8 @@ bool bootloader_flash_write(uint32_t offset, const uint8_t *data, uint16_t len)
     uint32_t aligned = total & ~(BL_WRITE_ALIGN - 1U);
     uint32_t tail    = total - aligned;
 
-    if (aligned > 0) {
-        if (!flush_aligned(buf, aligned)) {
-            /* flush_aligned already set the specific error code. */
-            return false;
-        }
+    if (aligned > 0 && !flush_aligned(buf, aligned)) {
+        return false;
     }
     memcpy(pending, buf + aligned, tail);
     pending_len = (uint8_t)tail;
@@ -220,8 +179,6 @@ bool bootloader_flash_finalize(void)
         fail(BL_FLASH_ERR_FINALIZE);
         return false;
     }
-    /* Never commit the vector table over an image with a hole in it: that
-       would make app_is_valid() pass on the next power cycle. */
     if (failed) {
         return false;
     }
@@ -235,12 +192,7 @@ bool bootloader_flash_finalize(void)
         pending_len = 0;
     }
 
-    /* Commit the deferred vector table as the very last operation. Before
-       this write the first BL_WRITE_ALIGN bytes at APP_START are still 0xFF
-       (we wrote 0xFF during streaming; both the L4 and H7 write paths skip
-       the actual program operation when source matches destination, so the
-       erased state survives intact). The real 32-byte write here completes
-       the image and makes app_is_valid() return true on the next boot. */
+    /* Commit the vector table only after every other write succeeds. */
     if (deferred_vt_armed) {
         if (!stm32_flash_write(APP_START_ADDRESS, deferred_vt, BL_WRITE_ALIGN)) {
             fail(BL_FLASH_ERR_WRITE);
